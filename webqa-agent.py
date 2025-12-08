@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import logging
 import os
 import subprocess
 import sys
@@ -9,8 +10,9 @@ import traceback
 import yaml
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
+from webqa_agent.executor.executor import Executor
 
-from webqa_agent.executor import ParallelMode
+# from webqa_agent.executor import ParallelMode
 
 
 def find_config_file(args_config=None):
@@ -376,34 +378,57 @@ async def run_tests(cfg):
 
     # Call executor
     try:
-        # Read concurrency from config (default 2), allow users to specify in config.target.max_concurrent_tests
-        raw_concurrency = cfg.get("target", {}).get("max_concurrent_tests", 2)
+        # Read concurrency from config (default 2), allow users to specify in config.target.max_concurrent_num
+        concurrency = cfg.get("parallel_execution", {}).get("max_concurrent", 2)
         try:
-            max_concurrent_tests = int(raw_concurrency)
-            if max_concurrent_tests < 1:
+            max_concurrent_num = int(concurrency)
+            if max_concurrent_num < 1:
                 raise ValueError
         except Exception:
-            print(f"⚠️  Invalid concurrency setting: {raw_concurrency}, fallback to 2")
-            max_concurrent_tests = 2
+            print(f"⚠️  Invalid concurrency setting: {concurrency}, fallback to 2")
+            max_concurrent_num = 2
 
-        print(f"⚙️ Concurrency: {max_concurrent_tests}")
+        print(f"⚙️ Concurrency: {max_concurrent_num}")
 
-        parallel_mode = ParallelMode([], max_concurrent_tests=max_concurrent_tests)
-        results, report_path, html_report_path, result_count = await parallel_mode.run(
-            url=target_url, llm_config=llm_config, test_configurations=test_configurations,
+        ###################################### NEW Parallel Mode ######################################
+        # Build full browser config from config file
+        # Apply Docker headless override
+        config_headless = cfg.get("browser_config", {}).get("headless", True)
+        headless = True if is_docker and not config_headless else config_headless
+
+        browser_cfg = {
+            **cfg.get("browser_config", {}),
+            "headless": headless,
+        }
+
+        await Executor(
+            max_concurrent=max_concurrent_num,
+            llm_cfg=llm_config,
+            test_cfg=test_configurations,
+            url=cfg.get("target", {}).get("url", ""),
             log_cfg=cfg.get("log", {"level": "info"}),
-            report_cfg=cfg.get("report", {"language": "en-US"})
-        )
-        if result_count:
-            print(f"🔢 Total evaluations: {result_count.get('total', 0)}")
-            print(f"✅ Passed: {result_count.get('passed', 0)}")
-            print(f"⚠️  Warning: {result_count.get('warning', 0)}")
-            print(f"❌ Failed: {result_count.get('failed', 0)}")
+            report_cfg=cfg.get("report", {"language": "en-US"}),
+            browser_cfg=browser_cfg,
+        ).run()
+        ###################################### NEW Parallel Mode ######################################
 
-        if html_report_path:
-            print("HTML report path: ", html_report_path)
-        else:
-            print("HTML report generation failed")
+        # parallel_mode = ParallelMode([], max_concurrent_num=max_concurrent_num)
+        # results, report_path, html_report_path, result_count = await parallel_mode.run(
+        #     url=target_url, llm_config=llm_config, test_configurations=test_configurations,
+        #     log_cfg=cfg.get("log", {"level": "info"}),
+        #     report_cfg=cfg.get("report", {"language": "en-US"})
+        # )
+
+        # if result_count:
+        #     print(f"🔢 Total evaluations: {result_count.get('total', 0)}")
+        #     print(f"✅ Passed: {result_count.get('passed', 0)}")
+        #     print(f"⚠️  Warning: {result_count.get('warning', 0)}")
+        #     print(f"❌ Failed: {result_count.get('failed', 0)}")
+        #
+        # if html_report_path:
+        #     print("HTML report path: ", html_report_path)
+        # else:
+        #     print("HTML report generation failed")
     except Exception:
         print("Test execution failed, stack trace:", file=sys.stderr)
         traceback.print_exc()

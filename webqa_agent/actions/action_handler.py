@@ -3,14 +3,14 @@ import datetime
 import json
 import os
 import re
+import logging
+import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from playwright.async_api import Page
-
-from webqa_agent.browser.driver import *
 
 
 # ===== Action Context Infrastructure for Error Propagation =====
@@ -103,28 +103,28 @@ class ActionHandler:
     def __init__(self):
         self.page_data = {}
         self.page_element_buffer = {}  # page element buffer
-        self.driver = None
+        self.session = None
         self.page = None
 
-    async def initialize(self, page: Page | None = None, driver=None):
+    async def initialize(self, page: Page | None = None, session=None):
         if page is not None:
             self.page = page
-            if driver is not None:
-                self.driver = driver
+            if session is not None:
+                self.session = session
             return self
         return self
 
     def _get_current_page(self) -> Page:
-        """Get current active page, prioritizing driver's page reference.
-        
+        """Get current active page, prioritizing session's page reference.
+
         This ensures we always operate on the latest page, which is critical
         when new pages/tabs are opened during test execution.
-        
+
         Returns:
             Page: The current active page instance
         """
-        if self.driver:
-            return self.driver.get_page()
+        if self.session:
+            return self.session.page
         return self.page
 
     async def update_element_buffer(self, new_element):
@@ -133,8 +133,7 @@ class ActionHandler:
         self.page_element_buffer = new_element
 
     async def go_to_page(self, page: Page, url: str, cookies=None):
-        # if not self.driver:
-        #     self.driver = await Driver.getInstance()
+        logging.debug(f"go_to_page called with url={url}, page={page.url if page else None}")
         self.page = page
         if cookies:
             try:

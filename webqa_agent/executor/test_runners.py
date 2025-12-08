@@ -246,7 +246,7 @@ class UXTestRunner(BaseTestRunner):
 
             try:
                 logging.info(f"{icon['running']} Running UX test: {test_config.test_name}")
-                page = session.get_page()
+                page = session.page
 
                 text_test = PageTextTest(llm_config, report_config=test_config.report_config)
                 text_result: SubTestResult = await text_test.run(page=page)
@@ -305,7 +305,7 @@ class LighthouseTestRunner(BaseTestRunner):
 
             try:
                 logging.info(f"{icon['running']} Running test: {test_config.test_name}")
-                browser_config = session.browser_config
+                browser_config = session.config
 
                 # Only run Lighthouse on Chromium browsers
                 if browser_config.get('browser_type') != 'chromium':
@@ -351,8 +351,8 @@ class BasicTestRunner(BaseTestRunner):
 
             try:
                 logging.info(f"{icon['running']} Running test: {test_config.test_name}")
-                page = session.get_page()
-                browser_config = session.browser_config
+                page = session.page
+                browser_config = session.config
 
                 # Discover clickable elements via crawler
                 from webqa_agent.crawler.crawl import CrawlHandler
