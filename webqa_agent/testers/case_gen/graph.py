@@ -14,9 +14,16 @@ from typing import Any, Dict, List
 from langgraph.graph import END, StateGraph
 
 from webqa_agent.actions.action_handler import ActionHandler
-from webqa_agent.crawler.deep_crawler import DeepCrawler, ElementKey
+from webqa_agent.crawler.deep_crawler import DeepCrawler, ElementKey, ElementMap
 from webqa_agent.testers.case_gen.agents.execute_agent import agent_worker_node
-from webqa_agent.testers.case_gen.prompts.planning_prompts import get_reflection_prompt, get_test_case_planning_system_prompt, get_test_case_planning_user_prompt
+from webqa_agent.testers.case_gen.prompts.planning_prompts import (
+    get_reflection_prompt,
+    get_planning_prompt,
+    get_test_case_planning_system_prompt,
+    get_test_case_planning_user_prompt,
+    get_element_filtering_system_prompt,
+    get_element_filtering_user_prompt,
+)
 from webqa_agent.testers.case_gen.state.schemas import MainGraphState
 from webqa_agent.utils.log_icon import icon
 from webqa_agent.utils import Display
@@ -78,49 +85,157 @@ async def plan_test_cases(state: MainGraphState) -> Dict[str, List[Dict[str, Any
         # Reset the replan flag and clear the temporary list
         return {"test_cases": updated_cases, "is_replan": False, "replan_count": replan_count, "replanned_cases": []}
 
-    # If not a replan, proceed with the original logic
-    logging.debug("Generating initial test plan.")
+    # If not a replan, proceed with two-stage LLM-driven planning
+    logging.debug("=== Stage 0: Generating initial test plan with two-stage architecture ===")
     ui_tester = state["ui_tester_instance"]
+    business_objectives = state.get("business_objectives", "No specific business objectives provided.")
+    language = state.get('language', 'zh-CN')
 
-    logging.info(f"Deep crawling page structure and elements for initial test plan...")
+    # === Stage 0: Data Collection ===
+    logging.info("Stage 0: Collecting full-page data...")
     page = await ui_tester.get_current_page()
     dp = DeepCrawler(page)
-    await dp.crawl(highlight=True, viewport_only=True)
+
+    # Full-page crawl with highlights
+    crawl_result = await dp.crawl(highlight=True, viewport_only=False)
+
+    # Check for unsupported page types at the start
+    if hasattr(crawl_result, 'page_status') and crawl_result.page_status == "UNSUPPORTED_PAGE":
+        page_type = getattr(crawl_result, 'page_type', 'unknown')
+        logging.warning(f"Initial page type ({page_type}) is unsupported, cannot generate test cases")
+        return {
+            "test_cases": [],
+            "is_replan": False,
+            "replan_count": 0,
+            "replanned_cases": []
+        }
     screenshot = await ui_tester._actions.b64_page_screenshot(
-        file_name="plan_or_replan", save_to_log=False, full_page=False
+        full_page=True,
+        file_name="plan_full_page",
+        context="agent"
     )
+
+    # Get all interactive elements (we'll filter them in Stage 1)
     await dp.remove_marker()
-    await dp.crawl(highlight=False, filter_text=True, viewport_only=True)
-    page_structure = dp.get_text()
-    logging.debug(f"----- plan cases ---- Page structure: {page_structure}")
 
-    business_objectives = state.get("business_objectives", "No specific business objectives provided.")
-    completed_cases = state.get("completed_cases")
+    # Define simplified template for element filtering (only essential fields for LLM judgment)
+    filter_template = [
+        ElementKey.TAG_NAME,
+        ElementKey.INNER_TEXT,
+        ElementKey.ATTRIBUTES,
+        ElementKey.CENTER_X,
+        ElementKey.CENTER_Y,
+    ]
 
-    language = state.get('language', 'zh-CN')
-    system_prompt = get_test_case_planning_system_prompt(
+    all_elements = dp.extract_interactive_elements(get_new_elems=False)
+
+    # Convert to simplified format for LLM filtering using ElementMap.clean()
+    filtered_elements_for_llm = ElementMap(data=all_elements).clean(
+        output_template=[str(t) for t in filter_template]
+    )
+
+    # Get page text and intelligently truncate
+    await dp.crawl(highlight=True, filter_text=True, viewport_only=False)
+    page_text_raw = dp.get_text()
+    page_text_array = json.loads(page_text_raw) if page_text_raw else []
+    page_text_info = DeepCrawler.smart_truncate_page_text(
+        page_text_array,
+        max_tokens=3000
+    )
+
+    logging.info(
+        f"Stage 0: Collected {len(all_elements)} interactive elements, "
+        f"{len(page_text_array)} text segments "
+        f"(using {page_text_info.get('estimated_tokens', 0)} tokens)"
+    )
+
+    # === Stage 1: LLM-Driven Element Filtering ===
+    logging.info("Stage 1: LLM-driven element filtering...")
+    filter_system = get_element_filtering_system_prompt(language)
+    filter_user = get_element_filtering_user_prompt(
+        url=state["url"],
         business_objectives=business_objectives,
-        completed_cases=completed_cases,
-        language=language,
+        elements=filtered_elements_for_llm,
+        max_elements=50
     )
 
-    user_prompt = get_test_case_planning_user_prompt(
+    # Use lightweight model for filtering (cost-effective)
+    filter_model = ui_tester.llm.filter_model
+    primary_model = ui_tester.llm.model
+    if filter_model == primary_model:
+        logging.debug(f"Using filter model: {filter_model} (same as primary model)")
+    else:
+        logging.debug(f"Using filter model: {filter_model} (lightweight model for cost efficiency, primary: {primary_model})")
+
+    stage1_start = datetime.datetime.now()
+    filter_response = await ui_tester.llm.get_llm_response(
+        system_prompt=filter_system,
+        prompt=filter_user,
+        images=None,  # No image needed for filtering
+        temperature=0.3,
+        model_override=filter_model
+    )
+    stage1_duration = (datetime.datetime.now() - stage1_start).total_seconds()
+    logging.debug(f"Stage 1 completed in {stage1_duration:.2f} seconds")
+
+    # Parse filtering result
+    try:
+        selected_elements = json.loads(filter_response)
+        selected_ids = [item["id"] for item in selected_elements]
+        logging.info(f"Stage 1: LLM selected {len(selected_ids)}/{len(all_elements)} priority elements")
+
+        # Build priority elements map (keep full info for Stage 2)
+        priority_elements = {
+            elem_id: all_elements[elem_id]
+            for elem_id in selected_ids
+            if elem_id in all_elements
+        }
+    except Exception as e:
+        logging.error(f"Stage 1: Element filtering failed: {e}, using fallback strategy")
+        logging.error(f"Stage 1: Raw response: {filter_response[:500]}...")
+        # Fallback: use first 50 elements
+        priority_elements = dict(list(all_elements.items())[:50])
+        logging.info(f"Stage 1: Fallback to first {len(priority_elements)} elements")
+
+    # === Stage 2: Test Case Planning with Enhanced Context ===
+    logging.info("Stage 2: Test case planning with enhanced context...")
+    # system_prompt = get_test_case_planning_system_prompt(
+    #     business_objectives=business_objectives,
+    #     language=language,
+    # )
+
+    # user_prompt = get_test_case_planning_user_prompt(
+    #     state_url=state["url"],
+    #     page_text_summary=page_text_info,
+    #     priority_elements=priority_elements,
+    # )
+    system_prompt, user_prompt = get_planning_prompt(
+        business_objectives=business_objectives,
         state_url=state["url"],
-        completed_cases=completed_cases,
-        reflection_history=state.get("reflection_history"),
-        remaining_objectives=state.get("remaining_objectives"),
+        language=language,
+        page_text_summary=page_text_info,
+        priority_elements=priority_elements,
     )
 
-    logging.info("Generating initial test plan - Sending request to LLM...")
+    logging.info("Stage 2: Sending request to primary LLM...")
     start_time = datetime.datetime.now()
 
+    # Get max_tokens from config or use default
+    configured_max_tokens = ui_tester.llm.llm_config.get("max_tokens", 8192)
+
     response = await ui_tester.llm.get_llm_response(
-        system_prompt=system_prompt, prompt=user_prompt, images=screenshot
+        system_prompt=system_prompt,
+        prompt=user_prompt,
+        images=screenshot,
+        temperature=0.1,
+        max_tokens=configured_max_tokens  # Use config value for flexibility
     )
 
     end_time = datetime.datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    logging.debug(f"LLM planning request completed in {duration:.2f} seconds")
+    stage2_duration = (end_time - start_time).total_seconds()
+    total_duration = stage1_duration + stage2_duration
+    logging.debug(f"Stage 2 completed in {stage2_duration:.2f} seconds")
+    logging.info(f"Two-stage planning completed: Stage 1 ({stage1_duration:.2f}s) + Stage 2 ({stage2_duration:.2f}s) = Total {total_duration:.2f}s")
 
     try:
         # Extract only the JSON part of the response, ignoring the scratchpad
@@ -283,7 +398,7 @@ async def reflect_and_replan(state: MainGraphState) -> dict:
     # Use DeepCrawler to get interactive elements mapping and highlighted screenshot
     logging.info(f"Deep crawling page structure and elements for reflection and replanning analysis...")
     dp = DeepCrawler(page)
-    curr = await dp.crawl(highlight=True, viewport_only=True)
+    curr = await dp.crawl(highlight=True, viewport_only=False)
     # Include position information for better replanning decisions
     reflect_template = [
         str(ElementKey.TAG_NAME),
@@ -294,9 +409,13 @@ async def reflect_and_replan(state: MainGraphState) -> dict:
     ]
     page_content_summary = curr.clean_dict(reflect_template)
     logging.debug(f"current page crawled result: {page_content_summary}")
-    screenshot = await ui_tester._actions.b64_page_screenshot(file_name="reflection", save_to_log=False, full_page=False)
+    screenshot = await ui_tester._actions.b64_page_screenshot(
+        full_page=True,
+        file_name="reflection",
+        context="agent"
+    )
     await dp.remove_marker()
-    await dp.crawl(highlight=False, filter_text=True, viewport_only=True)
+    await dp.crawl(highlight=True, filter_text=True, viewport_only=False)
     page_structure = dp.get_text()
     logging.debug(f"----- reflection ---- Page structure: {page_structure}")
 
@@ -384,14 +503,19 @@ async def execute_single_case(state: MainGraphState) -> dict:
     ui_tester_instance = state["ui_tester_instance"]
     case_name = case.get("name")
 
+    # Set test context for context-aware verification
+    ui_tester_instance.current_test_objective = case.get("objective", case.get("name"))
+    ui_tester_instance.current_success_criteria = case.get("success_criteria", [])
+    # Clear old execution history to avoid cross-case pollution
+    ui_tester_instance.execution_history.clear()
+    ui_tester_instance.last_action_context = None
+
     language = state.get('language', 'zh-CN')
     logging.debug(f"Execute case language: {language}")
     default_text = '智能功能测试' if language == 'zh-CN' else 'AI Function Test'
 
     with Display.display(f"{default_text} - {case_name}"):
-        # === 开始跟踪case数据 ===
-        # 使用start_case来同时设置名称和开始数据跟踪
-        ui_tester_instance.start_case(case_name, case)
+        # Note: Case recording is managed by agent_worker_node via CentralCaseRecorder
         logging.debug(f"Executing functional test: {case_name}")
 
         # Conditionally reset the session based on the test case flag
@@ -427,6 +551,7 @@ async def execute_single_case(state: MainGraphState) -> dict:
         # The result from the worker now contains the single case result
         case_result = result.get("case_result")
         modified_case = result.get("modified_case")
+        recorded_case = result.get("recorded_case")
 
         # Handle case modification when dynamic steps were added
         if modified_case:
@@ -454,11 +579,8 @@ async def execute_single_case(state: MainGraphState) -> dict:
             else:
                 logging.warning(f"Current test case index {current_index} out of range for test_cases array (length: {len(test_cases)})")
 
-        # === 结束case跟踪并获取详细数据 ===
-        final_status = case_result.get("status", "completed") if case_result else "failed"
-        final_summary = case_result.get("final_summary", "") if case_result else "No summary available"
-
-        ui_tester_instance.finish_case(final_status, final_summary)
+        # Note: Case finalization is handled by agent_worker_node
+        # The recorded_case from worker contains all step data
 
         # Check if this is a critical failure that should skip reflection
         if case_result and case_result.get("status") == "failed":
@@ -477,6 +599,10 @@ async def execute_single_case(state: MainGraphState) -> dict:
         # Include updated test_cases if case was modified
         if modified_case:
             return_value["test_cases"] = test_cases
+        
+        # Store recorded_case data from CentralCaseRecorder into graph state
+        if recorded_case:
+            return_value["recorded_cases"] = [recorded_case]
 
         return return_value
 
@@ -548,12 +674,13 @@ async def aggregate_results(state: MainGraphState) -> Dict[str, Dict[str, Any]]:
 
 
 async def cleanup_session(state: MainGraphState) -> Dict:
-    """Closes the browser session."""
-    logging.debug("Cleaning up browser session...")
-    ui_tester = state["ui_tester_instance"]
-    if ui_tester:
-        browser_results = await ui_tester.end_session()
-    return browser_results
+    """Cleanup hook for graph workflow completion.
+    
+    Note: Browser session cleanup is handled by test_runners.py to collect
+    monitoring data. This node serves as a graph completion marker.
+    """
+    logging.debug("Graph workflow cleanup node reached")
+    return {}
 
 
 # Define the main graph

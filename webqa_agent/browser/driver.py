@@ -64,6 +64,7 @@ class Driver:
                     "--disable-gpu",
                     "--force-device-scale-factor=1",
                     f'--window-size={browser_config["viewport"]["width"]},{browser_config["viewport"]["height"]}',
+                    "--block-new-web-contents",  # Block window.open() calls at browser level (Layer 6 defense)
                 ],
             )
 
@@ -78,6 +79,27 @@ class Driver:
             self.page = await self.context.new_page()
             browser_config["browser"] = "Chromium"
             self.config = browser_config
+
+            # Layer 7 defense: Event listeners to close unexpected new pages/popups
+            # This catches any tabs that bypass JS interception and browser args
+            async def close_unexpected_page(page):
+                """Close any new pages that manage to open despite interception layers."""
+                try:
+                    await page.close()
+                    logging.warning(
+                        f"[Tab Interception] Closed unexpected new page: {page.url}. "
+                        f"This indicates a bypass of JavaScript/browser-level interception."
+                    )
+                except Exception as e:
+                    logging.debug(f"Failed to close unexpected page: {e}")
+
+            # Listen for new pages at context level (all new tabs/windows)
+            self.context.on("page", close_unexpected_page)
+
+            # Listen for popups at page level (popup windows from current page)
+            self.page.on("popup", close_unexpected_page)
+
+            logging.debug("Tab interception event listeners registered (Layer 7 defense)")
 
             logging.debug(f"Browser instance created successfully with config: {browser_config}")
             return self.page
@@ -104,24 +126,17 @@ class Driver:
         except Exception as e:
             logging.error("Failed to get Driver instance: %s", e, exc_info=True)
             raise
-
-    async def get_new_page(self):
-        """Switches to the most recently opened page in the browser.
-
-        Returns:
-            Page: The new page instance.
-        """
+    
+    async def get_url(self):
+        """Returns: the current page URL and title."""
         try:
-            pages = self.context.pages
-            logging.debug(f"page number: {len(pages)}")
-            if len(pages) > 1:
-                logging.debug("New page detected.")
-                self.page = pages[-1]
-                return self.page
-            else:
-                return self.page
+            if self.page is None:
+                raise RuntimeError("No active page. Did you call create_browser?")
+            url = self.page.url
+            title = await self.page.title()
+            return url, title
         except Exception as e:
-            logging.error("Failed to get new page: %s", e, exc_info=True)
+            logging.error("Failed to get URL: %s", e, exc_info=True)
             raise
 
     async def close_browser(self):

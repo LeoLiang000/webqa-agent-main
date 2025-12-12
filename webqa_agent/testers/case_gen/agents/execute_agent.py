@@ -3,7 +3,7 @@ application.
 
 The agent worker is responsible for executing a single test case.
 """
-
+import asyncio
 import datetime
 import json
 import logging
@@ -14,14 +14,19 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 
+from webqa_agent.actions.action_types import ActionType, is_page_agnostic_action, get_page_agnostic_keywords
 from webqa_agent.crawler.deep_crawler import DeepCrawler
 from webqa_agent.testers.case_gen.prompts.agent_prompts import get_execute_system_prompt
 from webqa_agent.testers.case_gen.prompts.planning_prompts import get_dynamic_step_generation_prompt
 from webqa_agent.testers.case_gen.tools.element_action_tool import UIAssertTool, UITool
+from webqa_agent.testers.case_gen.tools.ux_tool import UIUXViewportTool
+from webqa_agent.testers.case_gen.utils.case_recorder import CentralCaseRecorder
 from webqa_agent.testers.case_gen.utils.message_converter import convert_intermediate_steps_to_messages
 from webqa_agent.utils.log_icon import icon
 
 LONG_STEPS = 30
+RETRY_STABILIZATION_DELAY = 1.0
+MIN_RECOVERY_CONFIDENCE = 0.7
 
 # ============================================================================
 # Critical Failure Detection Patterns
@@ -100,6 +105,26 @@ def extract_json_from_response(response_text: str) -> str:
     return response_text.strip()
 
 
+def safe_get_intermediate_step(result: dict, index: int = 0, subindex: int = 1, default: str = "") -> str:
+    """Safely access intermediate_steps to prevent list index out of range errors.
+
+    Args:
+        result: The result dictionary from agent execution
+        index: The index of the intermediate step (default: 0)
+        subindex: The subindex within the step tuple/list (default: 1)
+        default: Default value to return if access fails (default: "")
+
+    Returns:
+        The intermediate step content or default value
+    """
+    steps = result.get('intermediate_steps', [])
+    if isinstance(steps, list) and len(steps) > index:
+        step = steps[index]
+        if isinstance(step, (list, tuple)) and len(step) > subindex:
+            return step[subindex]
+    return default
+
+
 def extract_dom_diff_from_output(tool_output: str) -> dict:
     """Extract DOM diff information from tool output"""
     try:
@@ -176,21 +201,29 @@ def format_elements_for_llm(dom_diff: dict) -> list[dict]:
 
 
 async def generate_dynamic_steps_with_llm(
-    dom_diff: dict,
-    last_action: str,
-    test_objective: str,
-    executed_steps: int,
-    max_steps: int,
-    llm: any,
+    dom_diff: dict = None,
+    last_action: str = "",
+    test_objective: str = "",
+    executed_steps: int = 0,
+    max_steps: int = 5,
+    llm: any = None,
     current_case: dict = None,
     screenshot: str = None,
     tool_output: str = None,
-    step_success: bool = True
+    step_success: bool = True,
+    # New parameters for failure recovery mode
+    failure_recovery_mode: bool = False,
+    failed_instruction: str = "",
+    error_message: str = ""
 ) -> dict:
-    """Generate dynamic test steps using LLM with full test case context and visual information
-    
+    """Generate dynamic test steps or recover from failed steps using LLM
+
+    This function serves two purposes:
+    1. DOM Change Mode (failure_recovery_mode=False): Generate new test steps for newly appeared UI elements
+    2. Failure Recovery Mode (failure_recovery_mode=True): Adapt test plan when steps fail due to stale DOM
+
     Args:
-        dom_diff: New DOM elements detected
+        dom_diff: New DOM elements detected (used in DOM change mode)
         last_action: The action that triggered the new elements
         test_objective: Overall test objective
         executed_steps: Number of steps executed so far
@@ -200,12 +233,164 @@ async def generate_dynamic_steps_with_llm(
         screenshot: Base64 screenshot of current page state for visual context
         tool_output: Output from the tool execution for context (optional)
         step_success: Whether the previous step executed successfully (default: True)
-        
+        failure_recovery_mode: If True, operate in failure recovery mode instead of DOM change mode
+        failed_instruction: The instruction that failed (used in failure recovery mode)
+        error_message: The error message from the failed step (used in failure recovery mode)
+
     Returns:
-        Dict containing strategy ("insert" or "replace") and generated test steps
-        Format: {"strategy": "insert|replace", "reason": "explanation", "steps": [...]}
+        Dict containing strategy and generated test steps
+        DOM Change Mode: {"strategy": "insert|replace", "reason": "...", "steps": [...]}
+        Failure Recovery Mode: {"strategy": "retry_modified|skip|abort", "reason": "...", "steps": [...], "confidence": 0.0-1.0}
     """
-    
+
+    # === FAILURE RECOVERY MODE ===
+    if failure_recovery_mode:
+        if not failed_instruction or not error_message:
+            return {"strategy": "abort", "reason": "Missing failure context", "steps": [], "confidence": 0.0}
+
+        try:
+            # Build failure recovery prompt
+            all_steps = current_case.get("steps", []) if current_case else []
+            remaining_steps = all_steps[executed_steps:] if executed_steps < len(all_steps) else []
+            executed_steps_detail = all_steps[:executed_steps] if executed_steps > 0 else []
+
+            failure_prompt = f"""## Test Step Failure Recovery Analysis
+
+**Failed Step**: {executed_steps}/{len(all_steps)}
+**Failed Instruction**: {failed_instruction}
+**Error Message**: {error_message}
+
+**Test Context**:
+- Test Name: {current_case.get('name', 'Unknown') if current_case else 'Unknown'}
+- Test Objective: {test_objective}
+- Remaining Steps: {len(remaining_steps)}
+
+**Executed Steps History** (for context):
+{json.dumps(executed_steps_detail, ensure_ascii=False, indent=2) if executed_steps_detail else "None - This is the first step"}
+
+**Current Page State**:
+The screenshot shows the current UI state after the failure occurred.
+
+## Task
+
+Analyze why this step failed and determine the best recovery strategy:
+
+### Strategy Options:
+
+1. **retry_modified**: The element likely exists but with different characteristics. Suggest an alternative instruction that targets similar functionality using elements visible in the current page.
+
+2. **skip**: The step is non-critical or the functionality has already been achieved/tested in previous steps. Skipping won't impact test validity.
+
+3. **abort**: The step is critical to the test objective and cannot be achieved with current page state. Continuing would produce invalid results.
+
+## Decision Guidelines:
+
+- If remaining steps depend on this step's outcome, avoid "skip"
+- If error indicates fundamental issues (page crashed, wrong page), choose "abort"
+- If alternative elements with similar function exist, choose "retry_modified"
+- If functionality was already tested in earlier steps, choose "skip"
+
+## Response Format (JSON only):
+
+```json
+{{
+  "strategy": "retry_modified|skip|abort",
+  "steps": [{{"action": "alternative instruction"}}],
+  "reason": "detailed explanation of why this strategy was chosen",
+  "confidence": 0.85
+}}
+```
+
+**Important**:
+- For retry_modified: steps array must contain exactly one step with the new instruction
+- For skip/abort: steps array should be empty []
+- confidence should be 0.0-1.0 (if < 0.7, system may override to abort for safety)
+"""
+
+            # Call LLM with multi-modal context
+            if screenshot:
+                messages = [
+                    {"role": "system", "content": "You are a QA expert analyzing test step failures. Respond with JSON only."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": failure_prompt},
+                            {"type": "image_url", "image_url": {"url": screenshot, "detail": "low"}}
+                        ]
+                    }
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": "You are a QA expert analyzing test step failures. Respond with JSON only."},
+                    {"role": "user", "content": failure_prompt}
+                ]
+
+            response = await llm.ainvoke(messages)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+
+            # Parse JSON response
+            try:
+                json_content = extract_json_from_response(response_text)
+                result = json.loads(json_content)
+
+                # Validate response
+                if not isinstance(result, dict) or "strategy" not in result:
+                    logging.error("LLM response missing required 'strategy' field")
+                    return {"strategy": "abort", "reason": "Invalid LLM response format", "steps": [], "confidence": 0.0}
+
+                strategy = result.get("strategy")
+                if strategy not in ["retry_modified", "skip", "abort"]:
+                    logging.error(f"Invalid strategy '{strategy}', defaulting to abort")
+                    return {"strategy": "abort", "reason": f"Invalid strategy returned: {strategy}", "steps": [], "confidence": 0.0}
+
+                # Validate confidence
+                confidence = result.get("confidence", 0.5)
+                if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
+                    logging.warning(f"Invalid confidence {confidence}, defaulting to 0.5")
+                    confidence = 0.5
+
+                # Safety check: low confidence should abort
+                if confidence < MIN_RECOVERY_CONFIDENCE:
+                    logging.warning(f"Low confidence ({confidence}) in recovery strategy, overriding to abort")
+                    return {
+                        "strategy": "abort",
+                        "reason": f"Low confidence in recovery. Original suggestion: {result.get('reason', 'N/A')}",
+                        "steps": [],
+                        "confidence": confidence
+                    }
+
+                # Validate steps for retry_modified
+                if strategy == "retry_modified":
+                    steps = result.get("steps", [])
+                    if not steps or not isinstance(steps, list) or len(steps) == 0:
+                        logging.error("retry_modified strategy missing valid steps")
+                        return {"strategy": "abort", "reason": "retry_modified requires new instruction", "steps": [], "confidence": 0.0}
+
+                    # Validate step format
+                    valid_step = steps[0] if isinstance(steps[0], dict) and ("action" in steps[0] or "verify" in steps[0]) else None
+                    if not valid_step:
+                        logging.error("retry_modified step has invalid format")
+                        return {"strategy": "abort", "reason": "Invalid step format in retry_modified", "steps": [], "confidence": 0.0}
+
+                logging.info(f"Failure recovery strategy: {strategy} (confidence: {confidence:.2f})")
+                logging.debug(f"Recovery reason: {result.get('reason', 'N/A')}")
+
+                return {
+                    "strategy": strategy,
+                    "reason": result.get("reason", "No reason provided"),
+                    "steps": result.get("steps", []),
+                    "confidence": confidence
+                }
+
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse failure recovery LLM response: {e}")
+                return {"strategy": "abort", "reason": "JSON parsing failed", "steps": [], "confidence": 0.0}
+
+        except Exception as e:
+            logging.error(f"Error in failure recovery mode: {e}")
+            return {"strategy": "abort", "reason": f"Recovery failed: {str(e)}", "steps": [], "confidence": 0.0}
+
+    # === DOM CHANGE MODE (Original Logic) ===
     if not dom_diff:
         return {"strategy": "insert", "reason": "No new elements detected", "steps": []}
     
@@ -429,6 +614,13 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
 
     ui_tester_instance = config["configurable"]["ui_tester_instance"]
 
+    # Create an independent case recorder (decoupled from UITester store)
+    case_recorder = CentralCaseRecorder()
+    case_recorder.start_case(case_name, case_data=case)
+    
+    # Expose recorder to UITester so it can record action/verify steps automatically
+    ui_tester_instance.central_case_recorder = case_recorder
+
     # Note: case tracking is managed by execute_single_case node via start_case/finish_case
     # No need to set test name here as it's already handled
 
@@ -459,10 +651,12 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
     )
     logging.debug(f"LLM configured: {llm_config.get('model')} at {llm_config.get('base_url')}")
 
-    # Instantiate the custom tool with the ui_tester_instance
+    # Instantiate tools with correct parameters
+    # Note: All tools now use ui_tester_instance to dynamically get page
     tools = [
         UITool(ui_tester_instance=ui_tester_instance),
         UIAssertTool(ui_tester_instance=ui_tester_instance),
+        UIUXViewportTool(ui_tester_instance=ui_tester_instance, llm_config=llm_config, case_recorder=case_recorder),
     ]
     logging.debug(f"Tools initialized: {[tool.name for tool in tools]}")
 
@@ -607,7 +801,9 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
                 logging.debug(f"Preamble action {i+1} result: {tool_output[:200]}...")
                 preamble_messages.append(AIMessage(content=tool_output))
 
-                if "[failure]" in result['intermediate_steps'][0][1].lower():
+                # Safely check for failure in intermediate steps
+                intermediate_output = safe_get_intermediate_step(result, index=0, subindex=1, default="")
+                if "[failure]" in intermediate_output.lower():
                     final_summary = f"FINAL_SUMMARY: Preamble action '{instruction_to_execute}' failed, cannot proceed with the test case. Error: {tool_output}"
                     case_result = {"case_name": case_name, "final_summary": final_summary, "status": "failed"}
                     logging.error(f"Preamble action {i+1} failed, aborting test case")
@@ -633,15 +829,26 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
     case_steps = case.get("steps", [])  # Get reference to steps list
     total_steps = len(case_steps)
     failed_steps = []  # Track failed steps for summary generation
+    warning_steps = []  # Track steps with warnings (e.g., UX issues)
     case_modified = False  # Track if case was modified with dynamic steps
     dynamic_generation_count = 0  # Track how many times dynamic generation occurred
     dom_diff_cache = []
+    step_retry_tracker = {}  # Track retry attempts per step for adaptive recovery
 
     i = 0
     while i < len(case_steps):
         step = case_steps[i]
-        instruction_to_execute = step.get("action") or step.get("verify")
-        step_type = "Action" if step.get("action") else "Assertion"
+        instruction_to_execute = step.get("action") or step.get("verify") or step.get("ux_verify")
+        # step_type = "Action" if step.get("action") else "Assertion"
+        if step.get("action"):
+            step_type = "Action"
+        elif step.get("verify"):
+            step_type = "Assertion"
+        elif step.get("ux_verify"):
+            step_type = "UX_Verify"
+        else:
+            logging.warning(f"Unknown step type: {step}")
+            step_type = "Assertion"
 
         logging.info(f"Executing Step {i+1}/{total_steps} ({step_type}), step instruction: {instruction_to_execute}")
 
@@ -661,22 +868,21 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
         dp = DeepCrawler(page)
         await dp.crawl(highlight=True, viewport_only=True)
         screenshot = await ui_tester_instance._actions.b64_page_screenshot(
-            file_name="agent_step_vision", save_to_log=False
+            file_name=f"step_{i+1}_vision",
+            context="agent"
         )
         await dp.remove_marker()
         logging.debug("Generated highlighted screenshot for the agent.")
         # ------------------------------------
 
         # Create a new message with the current step's instruction and visual context
-        step_message = HumanMessage(
-            content=[
-                {"type": "text", "text": formatted_instruction},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"{screenshot}", "detail": "low"},
-                },
-            ]
-        )
+        step_content = [{"type": "text", "text": formatted_instruction}]
+        if screenshot:
+            step_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"{screenshot}", "detail": "low"},
+            })
+        step_message = HumanMessage(content=step_content)
 
         # The agent's history includes all prior messages
         current_messages = messages + [step_message]
@@ -707,6 +913,9 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
         elif step_type == "Assertion":
             tool_choice = {"type": "function", "function": {"name": "execute_ui_assertion"}}
             logging.debug("Forcing tool choice: execute_ui_assertion")
+        elif step_type == "UX_Verify":
+            tool_choice = {"type": "function", "function": {"name": "execute_ux_verify"}}
+            logging.debug("Forcing tool choice: execute_ux_verify")
         # -------------------------
 
         try:
@@ -738,18 +947,162 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
             logging.debug(f"Step {i+1} {step_type} completed in {duration:.2f} seconds")
             logging.debug(f"Step {i+1} tool output: {tool_output}")
             messages.append(AIMessage(content=tool_output))
+            
+            # Check for warnings in the tool output (e.g., UX issues)
+            # Check both agent output and raw tool result from intermediate steps
+            intermediate_output = safe_get_intermediate_step(result, index=0, subindex=1, default="")
+            combined_output = f"{tool_output}\n{intermediate_output}"
+            if "[warning]" in combined_output.lower():
+                warning_steps.append(i + 1)
+                logging.info(f"Step {i+1} completed with warnings (e.g., UX issues detected)")
 
-            # Check for critical failures that should immediately stop execution
+            # ===================================================================
+            # PRIORITY 0: Critical failure check (highest priority, independent of is_failure)
+            # ===================================================================
+            # Critical errors are unrecoverable and should abort immediately
+            # to save resources. Check BEFORE regular failure handling.
             if _is_critical_failure_step(tool_output, instruction_to_execute):
-                failed_steps.append(i + 1)
-                final_summary = f"FINAL_SUMMARY: Critical failure at step {i + 1}: '{instruction_to_execute}'. Error details: {tool_output[:200]}..."
-                logging.error(f"Critical failure detected at step {i + 1}, aborting remaining steps to save time")
-                break
 
-            # Check for failures in the tool output
-            if "[failure]" in result['intermediate_steps'][0][1].lower() or "failed" in tool_output.lower():
-                failed_steps.append(i + 1)
-                logging.warning(f"Step {i+1} detected as failed based on output")
+                # Smart differentiation: Check if unsupported page + page-agnostic operation
+                is_unsupported_page = "UNSUPPORTED_PAGE" in tool_output.upper()
+
+                if is_unsupported_page:
+                    # Determine if current operation is page-agnostic
+                    is_agnostic = _is_operation_page_agnostic(
+                        step_type=step_type,
+                        instruction=instruction_to_execute
+                    )
+
+                    if is_agnostic:
+                        # Page-agnostic operation: Allow continued execution (degraded mode)
+                        logging.warning(
+                            f"[WARNING] Step {i + 1} '{instruction_to_execute}' executed on unsupported page type. "
+                            f"This operation is page-agnostic and continuing with limited functionality. "
+                            f"Subsequent DOM-dependent operations will fail."
+                        )
+                        # Don't add to failed_steps, don't break - skip abort logic, continue execution
+                        # No action needed here - just let execution continue normally
+                        pass
+                    else:
+                        # DOM-dependent operation on unsupported page: Must abort
+                        failed_steps.append(i + 1)
+                        final_summary = (
+                            f"FINAL_SUMMARY: Critical failure at step {i + 1}: "
+                            f"'{instruction_to_execute}'. "
+                            f"DOM-dependent operation cannot execute on unsupported page type. "
+                            f"Error details: {tool_output[:200]}..."
+                        )
+                        logging.error(
+                            f"[CRITICAL] Step {i + 1} requires DOM elements but page is unsupported (PDF/plugin). "
+                            f"Aborting remaining {len(case_steps) - i - 1} steps to conserve resources."
+                        )
+                        break  # Abort test case immediately
+                else:
+                    # Other types of critical errors (not unsupported page): Abort immediately
+                    failed_steps.append(i + 1)
+                    final_summary = (
+                        f"FINAL_SUMMARY: Critical failure at step {i + 1}: "
+                        f"'{instruction_to_execute}'. "
+                        f"Error details: {tool_output[:200]}..."
+                    )
+                    logging.error(
+                        f"[CRITICAL] Step {i + 1} encountered critical failure. "
+                        f"Aborting remaining {len(case_steps) - i - 1} steps to conserve resources."
+                    )
+                    break  # Abort test case immediately
+
+            # ===================================================================
+            # PRIORITY 1: Regular failure check (only executed when not critical)
+            # ===================================================================
+            is_failure = "[failure]" in intermediate_output.lower() or "failed" in tool_output.lower()
+
+            # Check if this is an ELEMENT_NOT_FOUND error (potentially recoverable)
+            is_element_not_found = (
+                "[CRITICAL_ERROR:ELEMENT_NOT_FOUND]" in tool_output or
+                "element not found" in tool_output.lower()
+            )
+
+            if is_failure:
+                # Priority 1: Try recovery for ELEMENT_NOT_FOUND (recoverable critical error)
+                if is_element_not_found:
+                    # Get dynamic config to check if adaptive recovery is enabled
+                    dynamic_config = state.get("dynamic_step_generation", {"enabled": False})
+
+                    if dynamic_config.get("enabled", False):
+                        # Adaptive recovery enabled
+                        retry_key = f"step_{i}"
+                        retry_count = step_retry_tracker.get(retry_key, 0)
+
+                        if retry_count == 0:
+                            # Layer 1: Simple retry after page stabilization
+                            logging.info(f"Step {i+1} element not found, attempting Layer 1 recovery (simple retry after stabilization)")
+                            await asyncio.sleep(RETRY_STABILIZATION_DELAY)  # Let page stabilize
+                            step_retry_tracker[retry_key] = 1
+                            # Don't increment i, will retry same step
+                            continue
+
+                        elif retry_count == 1:
+                            # Layer 2: LLM-based adaptive replanning
+                            logging.info(f"Step {i+1} failed twice, attempting Layer 2 recovery (LLM adaptive replanning)")
+
+                            # Get current page screenshot for LLM analysis
+                            try:
+                                recovery_screenshot = await ui_tester_instance._actions.b64_page_screenshot(
+                                    file_name=f"step_{i+1}_recovery_attempt_{retry_count + 1}",
+                                    context="error"
+                                )
+                            except Exception as e:
+                                logging.error(f"Failed to capture recovery screenshot: {e}")
+                                recovery_screenshot = screenshot  # Fallback to last screenshot
+
+                            # Call unified dynamic adjustment function in failure recovery mode
+                            recovery_result = await generate_dynamic_steps_with_llm(
+                                failure_recovery_mode=True,
+                                failed_instruction=instruction_to_execute,
+                                error_message=tool_output,
+                                test_objective=case.get("objective", ""),
+                                executed_steps=i+1,
+                                llm=llm,
+                                current_case=case,
+                                screenshot=recovery_screenshot
+                            )
+
+                            strategy = recovery_result.get("strategy")
+                            confidence = recovery_result.get("confidence", 0.0)
+
+                            if strategy == "retry_modified":
+                                # Replace current step with adapted instruction
+                                new_steps = recovery_result.get("steps", [])
+                                if new_steps and len(new_steps) > 0:
+                                    logging.info(f"Adapting step {i+1} with new instruction (confidence: {confidence:.2f})")
+                                    logging.debug(f"Adaptation reason: {recovery_result.get('reason', 'N/A')}")
+                                    case_steps[i] = new_steps[0]
+                                    step_retry_tracker[retry_key] = 2  # Mark as adapted
+                                    continue  # Retry with adapted instruction
+
+                            elif strategy == "skip":
+                                logging.warning(f"Skipping step {i+1} based on recovery analysis: {recovery_result.get('reason', 'N/A')}")
+                                failed_steps.append(i + 1)
+                                # i will increment normally, skip this step
+
+                            elif strategy == "abort":
+                                logging.error(f"Aborting test at step {i+1} based on recovery analysis: {recovery_result.get('reason', 'N/A')}")
+                                final_summary = f"FINAL_SUMMARY: Test aborted at step {i+1}. {recovery_result.get('reason', 'Critical failure')}"
+                                break
+
+                        else:
+                            # Already adapted but still failing - mark as failed and continue
+                            failed_steps.append(i + 1)
+                            logging.error(f"Step {i+1} failed even after adaptation, marking as failed")
+                    else:
+                        # Adaptive recovery disabled for ELEMENT_NOT_FOUND
+                        failed_steps.append(i + 1)
+                        logging.warning(f"Step {i+1} element not found, but adaptive recovery is disabled")
+
+                # Priority 2: Other failures (non-critical, not ELEMENT_NOT_FOUND)
+                else:
+                    failed_steps.append(i + 1)
+                    logging.warning(f"Step {i+1} detected as failed based on output")
 
             # Check for objective achievement signal
             is_achieved, achievement_reason = _is_objective_achieved(tool_output)
@@ -774,9 +1127,10 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
                 min_elements_threshold = dynamic_config.get("min_elements_threshold", 2)
                 
                 if dynamic_enabled:
-                    # Extract DOM diff from tool output
-                    dom_diff = extract_dom_diff_from_output(result['intermediate_steps'][0][1])
-                    
+                    # Extract DOM diff from tool output (safely access intermediate_steps)
+                    intermediate_output = safe_get_intermediate_step(result, index=0, subindex=1, default="")
+                    dom_diff = extract_dom_diff_from_output(intermediate_output)
+
                     if dom_diff and len(dom_diff) >= min_elements_threshold and dom_diff not in dom_diff_cache:
                         logging.info(f"Detected {len(dom_diff)} new elements, starting dynamic test step generation")
                         
@@ -902,6 +1256,54 @@ async def agent_worker_node(state: dict, config: dict) -> dict:
         logging.debug("All test steps completed, generating final summary")
         logging.debug(f"Failed steps detected during execution: {failed_steps}")
 
+        # Helper function to sanitize messages for summary generation
+        def _sanitize_message_for_summary(msg, max_length: int = 250) -> str:
+            """Clean message content to avoid Azure OpenAI content filter triggers.
+
+            Removes:
+            - Base64 image URLs (main trigger)
+            - HTML tags (XSS detection)
+            - Error keywords that trigger safety filters
+            - DOM dumps
+            """
+            import re
+
+            # Extract content
+            if hasattr(msg, 'content'):
+                content = str(msg.content)
+            else:
+                content = str(msg)
+
+            # Remove base64 image URLs (primary trigger for content filter)
+            content = re.sub(
+                r'data:image/[^;]+;base64,[A-Za-z0-9+/=]+',
+                '[IMAGE_REMOVED]',
+                content
+            )
+
+            # Remove HTML tags (can trigger XSS detection)
+            content = re.sub(r'<[^>]+>', '', content)
+
+            # Remove error keywords that may trigger content filter
+            content = re.sub(
+                r'\b(denied|blocked|failed|error|forbidden|hack|exploit|inject)\b',
+                '[X]',
+                content,
+                flags=re.IGNORECASE
+            )
+
+            # Remove DOM dumps (can be large and trigger filters)
+            if 'pageDescription' in content or 'dom_tree' in content:
+                content = re.sub(
+                    r'pageDescription.*?(?===|$)',
+                    '[DOM_SUMMARY]',
+                    content,
+                    flags=re.DOTALL
+                )
+
+            # Truncate to max length
+            return content[:max_length]
+
         # Use the LLM directly to generate the summary (not through the agent)
         try:
             # Prepare context for summary generation
@@ -921,30 +1323,74 @@ FINAL_SUMMARY: Test case "{case_name}" completed successfully. All {total_steps}
 If there were failures:
 FINAL_SUMMARY: Test case "{case_name}" failed at step [X]. Error: [description]. Recovery attempts: [if any]. Recommendation: [suggested fix]."""
 
-            # Get the last few messages for context (excluding images to save tokens)
+            # Get and sanitize recent messages (reduced from 6 to 4 to minimize content filter risk)
             recent_messages = []
-            for msg in messages[-6:]:  # Last 3 exchanges
+            for msg in messages[-4:]:  # Last 2 exchanges (reduced from 6/3)
+                sanitized = _sanitize_message_for_summary(msg, max_length=250)
+
                 if isinstance(msg, HumanMessage):
-                    if isinstance(msg.content, list):
-                        # Extract text content only
-                        text_content = next((item["text"] for item in msg.content if item["type"] == "text"), str(msg.content))
-                        recent_messages.append(f"Human: {text_content}")
-                    else:
-                        recent_messages.append(f"Human: {msg.content}")
+                    recent_messages.append(f"User: {sanitized}")
                 elif isinstance(msg, AIMessage):
-                    recent_messages.append(f"AI: {msg.content[:500]}...")  # Truncate for brevity
+                    recent_messages.append(f"Agent: {sanitized}")
 
             context = "\n".join(recent_messages)
+            logging.debug(f"Sanitized context for summary generation ({len(context)} chars)")
+
             full_prompt = f"{summary_prompt}\n\nRecent test execution context:\n{context}"
 
-            # Use the LLM directly
-            response = await llm.ainvoke(full_prompt)
+            # Retry logic to handle content filter errors
+            agent_output = None
+            max_retries = 2
 
-            # Extract content from response
-            if hasattr(response, 'content'):
-                agent_output = response.content
-            else:
-                agent_output = str(response)
+            for attempt in range(max_retries):
+                try:
+                    logging.debug(f"Attempting summary generation (attempt {attempt + 1}/{max_retries})")
+                    response = await llm.ainvoke(full_prompt)
+
+                    # Successfully got response
+                    if hasattr(response, 'content'):
+                        agent_output = response.content
+                    else:
+                        agent_output = str(response)
+
+                    logging.debug("Summary generation successful")
+                    break
+
+                except Exception as llm_error:
+                    error_msg = str(llm_error)
+
+                    # Check if this is a content filter error
+                    is_content_filter = "content" in error_msg.lower() and ("filter" in error_msg.lower() or "policy" in error_msg.lower())
+
+                    if is_content_filter:
+                        logging.warning(
+                            f"Azure content filter triggered during summary generation (attempt {attempt + 1}): {error_msg[:200]}"
+                        )
+
+                        if attempt < max_retries - 1:
+                            # Retry with minimal context (no message history)
+                            logging.info("Retrying with minimal context (no message history)")
+                            full_prompt = f"""{summary_prompt}
+
+Test case: {case_name}
+Total steps: {total_steps}
+Failed steps: {len(failed_steps) if failed_steps else 0}
+
+Generate a brief summary without referencing specific execution details."""
+                            await asyncio.sleep(0.5)  # Brief delay before retry
+                        else:
+                            # Max retries reached
+                            logging.error("Max retries reached for summary generation, using fallback")
+                            break
+                    else:
+                        # Non-content-filter error, don't retry
+                        logging.error(f"Non-content-filter error in summary generation: {error_msg}")
+                        break
+
+            # If LLM failed after retries, agent_output will be None and fallback will be used below
+            if not agent_output:
+                # Will use fallback in except block
+                raise Exception("LLM summary generation failed after retries")
 
             # Ensure the summary has the correct format
             if agent_output and not agent_output.strip().startswith("FINAL_SUMMARY:"):
@@ -1011,8 +1457,13 @@ FINAL_SUMMARY: Test case "{case_name}" failed at step [X]. Error: [description].
             status = "failed"
         else:
             status = "passed"
+    
+    # Check if there are warning steps - upgrade status to "warning" if test passed but has warnings
+    if status == "passed" and warning_steps:
+        status = "warning"
+        logging.info(f"Test case '{case_name}' passed but has warnings at steps: {warning_steps}")
 
-    logging.debug(f"Test case '{case_name}' final status: {status} (success indicators: {has_success}, failure indicators: {has_failure})")
+    logging.debug(f"Test case '{case_name}' final status: {status} (success indicators: {has_success}, failure indicators: {has_failure}, warning steps: {warning_steps})")
 
     # Classify failure type if the test case failed
     failure_type = None
@@ -1034,8 +1485,15 @@ FINAL_SUMMARY: Test case "{case_name}" failed at step [X]. Error: [description].
 
     logging.debug(f"=== Agent Worker Completed for {case_name}. ===")
 
-    # Return only the result of the current case
-    return result
+    # Finalize case recording with final status
+    case_recorder.finish_case(final_status=status, final_summary=final_summary)
+
+    # Get recorded case data
+    result_with_case = dict(result)
+    recorded_case_data = case_recorder.get_case_data()
+    result_with_case["recorded_case"] = recorded_case_data
+    
+    return result_with_case
 
 
 def _is_objective_achieved(tool_output: str) -> tuple[bool, str]:
@@ -1062,6 +1520,60 @@ def _is_objective_achieved(tool_output: str) -> tuple[bool, str]:
         logging.debug(f"Error parsing objective achievement signal: {e}")
     
     return False, ""
+
+
+def _is_operation_page_agnostic(step_type: str, instruction: str) -> bool:
+    """
+    Determine if operation is page-type agnostic (can execute on unsupported page).
+
+    Page-agnostic operations don't depend on DOM elements and can execute on PDF/plugin pages:
+    - Browser navigation: GoBack, GoForward, GoToPage, Sleep
+    - UX verification: UX_Verify (already implements screenshot fallback)
+
+    Args:
+        step_type: Step type (Action, Verify, UX_Verify, UI_Assert)
+        instruction: Instruction text
+
+    Returns:
+        True if operation can execute on unsupported page, False otherwise
+
+    Examples:
+        >>> _is_operation_page_agnostic("Action", "GoBack to previous page")
+        True
+        >>> _is_operation_page_agnostic("Action", "Tap on element 123")
+        False
+        >>> _is_operation_page_agnostic("UX_Verify", "Check page content")
+        True
+    """
+
+    # Priority 1: Direct action type detection (most reliable)
+    # Check if instruction contains action type names directly
+    for action_type in [ActionType.GO_BACK, ActionType.SLEEP]:
+        if action_type in instruction:
+            logging.debug(f"Page-agnostic action detected via action type: {action_type}")
+            return True
+
+    # Priority 2: Keyword matching (handles varied phrasings)
+    # Get centralized keywords from action_types module
+    # This eliminates code duplication and ensures consistency
+    PAGE_AGNOSTIC_KEYWORDS = get_page_agnostic_keywords()
+
+    # Category C: Hybrid operations (available in degraded mode)
+    DEGRADED_MODE_TYPES = ['UX_Verify']
+
+    # Check step type - UX_Verify is verified to work on PDF pages (uses screenshot analysis)
+    if step_type in DEGRADED_MODE_TYPES:
+        return True
+
+    # Check keywords in instruction
+    instruction_lower = instruction.lower().replace('_', ' ').replace('-', ' ')
+    for keyword in PAGE_AGNOSTIC_KEYWORDS:
+        if keyword in instruction_lower:
+            logging.debug(f"Page-agnostic operation detected via keyword: '{keyword}'")
+            return True
+
+    # Default: DOM-dependent operation (needs to abort)
+    return False
 
 
 def _is_critical_failure_step(tool_output: str, step_instruction: str = "") -> bool:

@@ -1,14 +1,13 @@
-import asyncio
 import datetime
 import json
 import time
 import logging
 import re
 from pathlib import Path
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import Page
 from webqa_agent.crawler.dom_tree import DomTreeNode as dtree
 from webqa_agent.crawler.dom_cacher import DomCacher
-from typing import List, Dict, Optional, Any, Tuple, TypedDict, Union, Iterable
+from typing import List, Dict, Optional, Any, Tuple, Union, Iterable
 from pydantic import BaseModel, Field
 from enum import Enum
 from itertools import groupby
@@ -79,6 +78,7 @@ class ElementKey(Enum):
 DEFAULT_OUTPUT_TEMPLATE = [
     ElementKey.TAG_NAME.value,
     ElementKey.INNER_TEXT.value,
+    ElementKey.ATTRIBUTES.value,  # Include attributes to prevent LLM hallucinations about target="_blank"
     ElementKey.CENTER_X.value,
     ElementKey.CENTER_Y.value
 ]
@@ -132,6 +132,10 @@ class CrawlResultModel(BaseModel):
     element_tree: Dict[str, Any] = Field(default_factory=dict)
     flat_element_map: ElementMap = Field(default_factory=ElementMap)
     diff_element_map: ElementMap = Field(default_factory=ElementMap)
+
+    # Page status fields for unsupported page detection (backward compatible)
+    page_status: str = Field(default="NORMAL", description="NORMAL or UNSUPPORTED_PAGE")
+    page_type: Optional[str] = Field(default=None, description="pdf, plugin, download, etc.")
 
     def raw_dict(self) -> Dict[str, Any]:
         """Get raw flattened element data with all fields."""
@@ -191,6 +195,82 @@ class DeepCrawler:
         self._last_crawl_time = None  # Timestamp of last crawl operation
 
     # ------------------------------------------------------------------------
+    # HELPER METHODS
+    # ------------------------------------------------------------------------
+
+    async def _detect_page_type(self, page: Page) -> Tuple[str, Optional[str]]:
+        """Detect if the page is an unsupported type (PDF, plugin, etc.) using multi-layered detection.
+
+        Uses a 3-layer detection strategy for high reliability:
+        1. URL extension check (fast, reliable)
+        2. PDF embed element detection (catches Chromium PDF viewer)
+        3. document.contentType check (backup)
+
+        Args:
+            page: The Playwright Page object to check.
+
+        Returns:
+            Tuple of (status, page_type):
+                - ("NORMAL", None) for regular HTML pages
+                - ("UNSUPPORTED_PAGE", "pdf") for PDF documents
+                - ("UNSUPPORTED_PAGE", "plugin") for plugin content
+                - ("UNSUPPORTED_PAGE", "download") for download files
+        """
+        try:
+            # === Layer 1: URL Extension Check (Fastest, Most Reliable) ===
+            url = page.url.lower()
+
+            # PDF detection via URL
+            if url.endswith('.pdf'):
+                logging.info(f"Detected PDF via URL suffix: {url}")
+                return ("UNSUPPORTED_PAGE", "pdf")
+
+            # Download file detection via URL
+            download_extensions = [".zip", ".rar", ".exe", ".dmg", ".pkg", ".deb", ".tar", ".gz"]
+            for ext in download_extensions:
+                if url.endswith(ext):
+                    logging.info(f"Detected download file via URL: {url}")
+                    return ("UNSUPPORTED_PAGE", "download")
+
+            # === Layer 2: PDF Embed Element Detection (Catches Chromium PDF Viewer) ===
+            has_pdf_embed = await page.evaluate("""() => {
+                return document.querySelector('embed[type="application/pdf"]') !== null ||
+                       document.querySelector('object[type="application/pdf"]') !== null ||
+                       document.querySelector('iframe[src*=".pdf"]') !== null;
+            }""")
+
+            if has_pdf_embed:
+                logging.info(f"Detected embedded PDF viewer on page: {url}")
+                return ("UNSUPPORTED_PAGE", "pdf")
+
+            # === Layer 3: document.contentType Check (Backup Method) ===
+            content_type = await page.evaluate("() => document.contentType || ''")
+
+            # PDF detection via content type
+            if content_type == "application/pdf":
+                logging.info(f"Detected PDF via document.contentType: {url}")
+                return ("UNSUPPORTED_PAGE", "pdf")
+
+            # Plugin detection (Flash, Silverlight, etc.)
+            plugin_patterns = [
+                "application/x-shockwave-flash",
+                "application/x-silverlight",
+                "application/x-java-applet"
+            ]
+            for pattern in plugin_patterns:
+                if pattern in content_type:
+                    logging.info(f"Detected plugin content ({pattern}): {url}")
+                    return ("UNSUPPORTED_PAGE", "plugin")
+
+            # Regular HTML page
+            return ("NORMAL", None)
+
+        except Exception as e:
+            # On any error, fail safely to NORMAL to avoid false positives
+            logging.warning(f"Page type detection failed (assuming NORMAL page): {e}")
+            return ("NORMAL", None)
+
+    # ------------------------------------------------------------------------
     # CORE CRAWLING METHODS
     # ------------------------------------------------------------------------
 
@@ -220,6 +300,17 @@ class DeepCrawler:
         """
         if page is None:
             page = self.page
+
+        # Multi-layer detection of unsupported page types (PDF, plugins, etc.)
+        page_status, page_type = await self._detect_page_type(page)
+        if page_status == "UNSUPPORTED_PAGE":
+            logging.warning(f"Detected unsupported page type: {page_type}, skipping crawl")
+            return CrawlResultModel(
+                flat_element_map=ElementMap(data={}),
+                element_tree={},
+                page_status=page_status,
+                page_type=page_type
+            )
 
         try:
             
@@ -538,6 +629,104 @@ class DeepCrawler:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(node, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def smart_truncate_page_text(
+        text_array: List[str],
+        max_tokens: int = 3000,
+        strategy: str = "head_tail_sample"
+    ) -> Dict[str, Any]:
+        """
+        Intelligently truncate page text while preserving semantic completeness.
+
+        Based on 2024 research on semantic chunking and context preservation:
+        - Avoids "lost-in-the-middle" problem
+        - Preserves page structure (head, middle sample, tail)
+        - Maintains overall context and flow
+
+        Args:
+            text_array: Original text array from get_text()
+            max_tokens: Maximum token budget (default: 3000)
+            strategy: Truncation strategy (currently supports "head_tail_sample")
+
+        Returns:
+            Dict containing:
+                - summary: Overview of the truncation
+                - text_content: Sampled text segments
+                - coverage: Coverage ratio (selected/total)
+                - estimated_tokens: Estimated token count
+        """
+        if not text_array:
+            return {
+                "summary": "No text content found",
+                "text_content": [],
+                "coverage": "0/0 (0%)",
+                "estimated_tokens": 0,
+                "strategy_used": strategy
+            }
+
+        total_items = len(text_array)
+        # Conservative estimate: 1 token ≈ 2 chars (mixed Chinese/English)
+        char_budget = max_tokens * 2
+
+        if strategy == "head_tail_sample":
+            result_parts = []
+            current_chars = 0
+
+            # Keep head 30% (navigation, titles, important info)
+            keep_head = int(total_items * 0.3)
+            for item in text_array[:keep_head]:
+                if current_chars + len(item) > char_budget * 0.5:
+                    break
+                result_parts.append(item)
+                current_chars += len(item)
+
+            # Middle sampling (max 20 samples to maintain page flow)
+            middle_start = keep_head
+            middle_end = max(keep_head, total_items - int(total_items * 0.1))
+            middle_section = text_array[middle_start:middle_end]
+
+            if middle_section:
+                sample_rate = max(1, len(middle_section) // 20)
+                for item in middle_section[::sample_rate]:
+                    if current_chars + len(item) > char_budget * 0.8:
+                        break
+                    result_parts.append(item)
+                    current_chars += len(item)
+
+            # Keep tail 10% (footer, contact, legal info)
+            keep_tail = int(total_items * 0.1)
+            for item in text_array[-keep_tail:] if keep_tail > 0 else []:
+                if current_chars + len(item) > char_budget:
+                    break
+                result_parts.append(item)
+                current_chars += len(item)
+
+            return {
+                "summary": f"Intelligently sampled {len(result_parts)} from {total_items} text segments",
+                "text_content": result_parts,
+                "coverage": f"{len(result_parts)}/{total_items} ({len(result_parts)/total_items*100:.1f}%)",
+                "estimated_tokens": current_chars // 2,
+                "strategy_used": strategy
+            }
+
+        else:
+            # Fallback: simple truncation
+            result = []
+            chars = 0
+            for item in text_array:
+                if chars + len(item) > char_budget:
+                    break
+                result.append(item)
+                chars += len(item)
+
+            return {
+                "summary": f"Simple truncation: {len(result)}/{total_items} items",
+                "text_content": result,
+                "coverage": f"{len(result)}/{total_items} ({len(result)/total_items*100:.1f}%)",
+                "estimated_tokens": chars // 2,
+                "strategy_used": "simple_truncate"
+            }
 
     # ------------------------------------------------------------------------
     # VISUAL DEBUGGING METHODS

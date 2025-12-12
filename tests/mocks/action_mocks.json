@@ -336,56 +336,53 @@
       "actions": [
         {
           "type": "Scroll",
-          "locate": null,
-          "param": {
-            "direction": "down",
-            "scrollType": "untilBottom",
-            "distance": null
-          }
+          "locate": {"id": "1"},
+          "param": null
         },
         {
           "type": "Scroll",
-          "locate": null,
-          "param": {
-            "direction": "up",
-            "scrollType": "untilTop",
-            "distance": null
-          }
+          "locate": {"id": "2"},
+          "param": null
         }
       ],
-      "id_map": {}
+      "id_map": {
+        "1": {
+          "id": 100,
+          "tagName": "footer",
+          "isInViewport": false,
+          "selector": "footer#site-footer",
+          "xpath": "//*[@id=\"site-footer\"]",
+          "center_y": 2000
+        },
+        "2": {
+          "id": 101,
+          "tagName": "header",
+          "isInViewport": false,
+          "selector": "header#site-header",
+          "xpath": "//*[@id=\"site-header\"]",
+          "center_y": 50
+        }
+      }
     },
     {
       "url": "https://arxiv.org/list/astro-ph/new",
       "actions": [
         {
           "type": "Scroll",
-          "locate": null,
-          "param": {
-            "direction": "down",
-            "scrollType": "once"
-          }
-        },
-        {
-          "type": "Scroll",
-          "locate": null,
-          "param": {
-            "direction": "down",
-            "scrollType": "once",
-            "distance": 400
-          }
-        },
-        {
-          "type": "Scroll",
-          "locate": null,
-          "param": {
-            "direction": "up",
-            "scrollType": "once",
-            "distance": 200
-          }
+          "locate": {"id": "1"},
+          "param": null
         }
       ],
-      "id_map": {}
+      "id_map": {
+        "1": {
+          "id": 200,
+          "tagName": "section",
+          "isInViewport": false,
+          "selector": "section.results",
+          "xpath": "//section[@class='results']",
+          "center_y": 1500
+        }
+      }
     }
   ],
   "SelectDropdown": [

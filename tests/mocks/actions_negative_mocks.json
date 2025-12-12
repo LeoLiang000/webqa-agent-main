@@ -63,24 +63,30 @@
   ],
   "Scroll_Negative": [
     {
+      "description": "Scroll without locate.id should fail",
       "url": "https://arxiv.org/list/astro-ph/new",
       "actions": [
         {
           "type": "Scroll",
           "locate": null,
-          "param": {
-            "direction": "right",
-            "scrollType": "once"
-          }
+          "param": null
         },
         {
           "type": "Scroll",
-          "locate": null,
-          "param": {
-            "direction": "down",
-            "scrollType": "untilRight",
-            "distance": null
-          }
+          "locate": {},
+          "param": null
+        }
+      ],
+      "id_map": {}
+    },
+    {
+      "description": "Scroll with non-existent element should fail",
+      "url": "https://arxiv.org/list/astro-ph/new",
+      "actions": [
+        {
+          "type": "Scroll",
+          "locate": {"id": "999"},
+          "param": null
         }
       ],
       "id_map": {}

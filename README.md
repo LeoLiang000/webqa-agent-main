@@ -54,9 +54,9 @@ vibecoding, vibe coding, web evaluation, autonomous exploration, web testing aut
 
 ### 📋 Feature Highlights
 
-- **🤖 AI-Powered Testing**: Performs autonomous website testing—explores pages, plans actions, and executes end-to-end flows without manual scripting.
-- **📊 Multi-Dimensional Observation**: Covers functionality, performance, user experience, and basic security; evaluates load speed, design details, and links to surface issues.
-- **🎯 Actionable Recommendations**: Runs in real browsers and provides concrete suggestions for improvement.
+- **🤖 AI-Powered Testing**: Performs autonomous website testing with intelligent planning and reflection—explores pages, plans actions, and executes end-to-end flows without manual scripting. Features 2-stage architecture (lightweight filtering + comprehensive planning) and dynamic test generation for newly appeared UI elements.
+- **📊 Multi-Dimensional Observation**: Covers functionality, performance, user experience, and basic security; evaluates load speed, design details, and links to surface issues. Uses multi-modal analysis (screenshots + DOM structure + text content) and DOM diff detection to discover new test opportunities.
+- **🎯 Actionable Recommendations**: Runs in real browsers with smart element prioritization and automatic viewport management. Provides concrete suggestions for improvement with adaptive recovery mechanisms for robust test execution.
 - **📈 Visual Reports**: Generates detailed HTML test reports with clear, multi-dimensional views for analysis and tracking.
 
 ## 📹 Examples
@@ -92,11 +92,16 @@ git clone https://github.com/MigoXLab/webqa-agent.git
 cd webqa-agent
 ```
 
-Install Python >= 3.10 and run the following commands:
+1. Recommended: Install dependencies with [uv](https://github.com/astral-sh/uv) (Python>=3.11):
 
 ```bash
-pip install -r requirements.txt
-playwright install
+uv sync
+```
+
+2. Install Chromium browser:
+
+```bash
+uv run playwright install chromium
 ```
 
 Performance Analysis - Lighthouse (Optional)
@@ -124,8 +129,24 @@ nuclei -version        # Verify successful installation
 After configuring `config/config.yaml` (refer to "Usage > Test Configuration"), run:
 
 ```bash
-python webqa-agent.py
+uv run python webqa-agent.py
 ```
+
+### 🖥️ Visual Web Interface
+
+WebQA Agent provides a user-friendly visual interface powered by Gradio.
+
+```bash
+# Install Gradio
+uv add "gradio>5.44.0"
+# Launch the Web UI
+uv run python app.py
+
+# Launch with Chinese interface
+GRADIO_LANGUAGE=zh-CN uv run python app.py
+```
+
+Access the interface at http://localhost:7860.
 
 ## Usage
 
@@ -137,6 +158,7 @@ python webqa-agent.py
 target:
   url: https://example.com/                       # Website URL to test
   description: example description
+  # max_concurrent_tests: 2                       # Optional, default parallel 2
 
 test_config:                                      # Test configuration
   function_test:                                  # Functional testing
@@ -145,8 +167,8 @@ test_config:                                      # Test configuration
     business_objectives: example business objectives  # Recommended to include test scope, e.g., test search functionality
     dynamic_step_generation:                      # Optional, configuration for dynamic steps generation
       enabled: True                               # Optional, default False, recommended to set True to enable dynamic step generation
-      max_dynamic_steps: 5                        # Optional, default 5 test steps generated per trigger
-      min_elements_threshold: 2                   # Optional, default trigger threshold is 2 DOM element differences
+      max_dynamic_steps: 10                       # Optional, default 5, this example uses 10
+      min_elements_threshold: 1                   # Optional, default 2, this example uses 1 for higher sensitivity
   ux_test:                                        # User experience testing
     enabled: True
   performance_test:                               # Performance analysis
@@ -155,39 +177,50 @@ test_config:                                      # Test configuration
     enabled: False
 
 llm_config:                                       # Vision model configuration, currently supports OpenAI SDK compatible format only
-  model: gpt-4.1-2025-04-14                       # Recommended
+  model: gpt-4.1-2025-04-14                       # Primary model for Stage 2 test planning (Recommended)
+  filter_model: gpt-4o-mini                       # Lightweight model for Stage 1 element filtering (cost-effective)
   api_key: your_api_key
   base_url: https://api.example.com/v1
+  temperature: 0.1                                # Optional, default 0.1
+  # top_p: 0.9                                    # Optional, if not set, this parameter will not be passed
+  # max_tokens: 8192                              # Optional, maximum output tokens (supports generating more test cases)
 
 browser_config:
   viewport: {"width": 1280, "height": 720}
   headless: False                                 # Automatically overridden to True in Docker environment
   language: zh-CN
   cookies: []
+  save_screenshots: False                         # Whether to save screenshots to local disk (default: False)
+
+report:
+  language: en-US                                 # zh-CN, en-US
+
+log:
+  level: info
 ```
 
 Please note the following important considerations when configuring and running tests:
 
 #### 1. Functional Testing Notes
 
-- **AI Mode**: When specifying the number of test cases to generate in the configuration file, the system may re-plan based on actual page conditions. This may result in the final number of executed test cases differing from the initial configuration to ensure coverage and effectiveness.
+- **AI Mode**: Uses a 2-stage planning architecture where Stage 1 (filter_model) prioritizes elements for efficient analysis, and Stage 2 (primary model) generates comprehensive test cases. The system may reflect and re-plan based on actual page conditions and test coverage, which may result in the final number of executed test cases differing from the initial configuration to ensure effectiveness. When `dynamic_step_generation` is enabled, the system automatically generates additional test steps for newly appeared UI elements (e.g., dropdowns, modals) detected through DOM diff analysis.
 
 - **Default Mode**: The `default` mode focuses on whether UI interactions (e.g., clicks and navigations) complete successfully.
 
 #### 2. User Experience Testing Notes
 
-UX (User Experience) testing focuses on usability, and user-friendliness. The model output in the results provides suggestions based on best practices to guide optimization.
+UX (User Experience) testing focuses on usability and user-friendliness. Uses multi-modal analysis combining screenshots, DOM structure, and text content to evaluate visual quality, detect typos/grammar issues, and validate layout rendering. The model output in the results provides suggestions based on best practices to guide optimization.
 
 ### 🧠 Recommended Models
 
-Based on our testing, these models work well with WebQA Agent:
+The following models have been adapted and verified, and are recommended:
 
-| Model                             | Key Strengths               | Notes                           |
-|-----------------------------------|-----------------------------|---------------------------------|
-| **gpt-4.1-2025-04-14** ⭐         | High accuracy & reliability | **Best choice**                 |
-| **gpt-4.1-mini-2025-04-14**       | Cost-effective              | **Economical and practical**    |
-| **qwen3-vl-235b-a22b-instruct**   | Open-source, GPT-4.1 level  | **Best for on-premise**         |
-| **doubao-seed-1-6-vision-250815** | Vision capabilities         | **Excellent web understanding** |
+| Model                             | Recommendation              |
+|-----------------------------------|-----------------------------|
+| **gpt-4.1-2025-04-14**            | High accuracy and reliability |
+| **gpt-4.1-mini-2025-04-14**       | Economical and practical |
+| **qwen3-vl-235b-a22b-instruct**   | Open-source model, preferred for on-premise |
+| **doubao-seed-1-6-vision-250815** | Good web understanding, supports visual recognition |
 
 
 ### View Results

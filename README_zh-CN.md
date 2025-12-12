@@ -23,7 +23,7 @@
 
 <p align="center">
   体验Demo 🤗<a href="https://huggingface.co/spaces/mmmay0722/WebQA-Agent">HuggingFace</a> | 🚀<a href="https://modelscope.cn/studios/mmmmei22/WebQA-Agent/summary">ModelScope</a><br>
-  加入我们 🎮<a href="https://discord.gg/K5TtkVcx">Discord</a> | 💬<a href="https://aicarrier.feishu.cn/docx/NRNXdIirXoSQEHxhaqjchUfenzd">微信群</a>
+  加入我们 🎮<a href="https://discord.gg/fG5QAxYyNr">Discord</a> | 💬<a href="https://aicarrier.feishu.cn/docx/NRNXdIirXoSQEHxhaqjchUfenzd">微信群</a>
 </p>
 
 <p align="center"><a href="README.md">English</a> · <a href="README_zh-CN.md">简体中文</a></p>
@@ -53,9 +53,9 @@ Vibecoding, Vibe coding, 网页测试自动化, 浏览器测试工具, AI驱动�
 
 ### 📋 特性概览
 
-- **🤖 AI 自主测试**：WebQA-Agent能够自主进行网站测试，无需手写脚本，自动探索页面、规划动作并执行端到端流程
-- **📊 多维度观测**：覆盖功能、性能、用户体验、安全等核心场景，评估页面加载速度、设计细节和链接，全面保障系统质量
-- **🎯 可执行建议**：基于真实浏览器运行，输出具体的优化与改进建议
+- **🤖 AI 自主测试**：WebQA-Agent具备智能规划与反思能力，能够自主进行网站测试，无需手写脚本，自动探索页面、规划动作并执行端到端流程。采用两阶段架构（轻量级过滤+全面规划），并支持动态生成针对新出现UI元素的测试步骤
+- **📊 多维度观测**：覆盖功能、性能、用户体验、安全等核心场景，评估页面加载速度、设计细节和链接，全面保障系统质量。采用多模态分析（截图+DOM结构+文本内容）和DOM差异检测，发现新的测试机会
+- **🎯 可执行建议**：基于真实浏览器运行，具备智能元素优先级排序和自动视口管理能力，输出具体的优化与改进建议，并提供自适应恢复机制确保测试稳健执行
 - **📈 可视化报告**：生成详细的HTML测试报告，多维度、可视化展示执行结果，便于分析与追踪
 
 ## 📹 示例演示
@@ -92,20 +92,23 @@ git clone https://github.com/MigoXLab/webqa-agent.git
 cd webqa-agent
 ```
 
-安装 Python >= 3.10，运行以下命令：
+1. 推荐使用 [uv](https://github.com/astral-sh/uv) 安装依赖（Python>=3.11）：
 
 ```bash
-pip install -r requirements.txt
-playwright install
+uv sync
+```
 
+2. 安装 Chromium 浏览器：
+
+```bash
+uv run playwright install chromium
 ```
 
 性能分析 - Lighthouse 安装（可选）
 
 ```bash
-# 需要 Node.js >= 18.0.0 package.json
+# 需要 Node.js >= 18.0.0
 npm install
-
 ```
 
 安全扫描 - Nuclei 安装（可选）
@@ -124,11 +127,27 @@ nuclei -version        # 验证安装成功
 
 ```
 
-参考“使用说明 > 测试配置”进行 `config/config.yaml` 配置后，运行下方命令。
+参考"使用说明 > 测试配置"进行 `config/config.yaml` 配置后，运行下方命令。
 
 ```bash
-python webqa-agent.py
+uv run python webqa-agent.py
 ```
+
+### 🖥️ 可视化 Web 界面
+
+WebQA Agent 提供了基于 Gradio 的可视化界面，操作更加便捷。
+
+```bash
+# 安装 Gradio
+uv add "gradio>5.44.0"
+# 启动 Web UI
+uv run python app.py
+
+# 启动中文界面
+GRADIO_LANGUAGE=zh-CN uv run python app.py
+```
+
+访问地址：http://localhost:7860。
 
 ## 使用说明
 
@@ -140,6 +159,7 @@ python webqa-agent.py
 target:
   url: https://example.com/                       # 需要测试的网站URL
   description: example description
+  # max_concurrent_tests: 2                       # 可选，默认并行2个
 
 test_config:                                      # 测试项配置
   function_test:                                  # 功能测试
@@ -148,8 +168,8 @@ test_config:                                      # 测试项配置
     business_objectives: example business objectives  # 建议加入测试范围，如：测试搜索功能
     dynamic_step_generation:                      # 可选，动态生成步骤配置
       enabled: True                               # 可选, 默认False，建议设置为True使能动态步骤生成
-      max_dynamic_steps: 5                        # 可选，默认每次触发生成5步测试步骤
-      min_elements_threshold: 2                   # 可选，默认触发阈值为2个dom元素差异
+      max_dynamic_steps: 10                       # 可选，默认为5，此示例使用10
+      min_elements_threshold: 1                   # 可选，默认为2，此示例使用1以提高灵敏度
   ux_test:                                        # 用户体验测试
     enabled: True
   performance_test:                               # 性能分析
@@ -158,39 +178,50 @@ test_config:                                      # 测试项配置
     enabled: False
 
 llm_config:                                       # 视觉模型配置，当前仅支持 OpenAI SDK 兼容格式
-  model: gpt-4.1-2025-04-14                       # 推荐使用
+  model: gpt-4.1-2025-04-14                       # 第二阶段测试规划的主模型（推荐）
+  filter_model: gpt-4o-mini                       # 第一阶段元素过滤的轻量级模型（经济实用）
   api_key: your_api_key
   base_url: https://api.example.com/v1
+  temperature: 0.1                                # 可选，默认0.1
+  # top_p: 0.9                                    # 可选，如未设置将不传递该参数
+  # max_tokens: 8192                              # 可选，最大输出token数（支持生成更多测试用例）
 
 browser_config:
   viewport: {"width": 1280, "height": 720}
   headless: False                                 # Docker环境会自动覆盖为True
   language: zh-CN
   cookies: []
+  save_screenshots: False                         # 是否将截图保存到本地磁盘（默认：False）
+
+report:
+  language: en-US                                 # zh-CN, en-US
+
+log:
+  level: info
 ```
 
 在配置和运行测试时，请注意以下重要事项：
 
 #### 1. 功能测试说明
 
-- **AI模式**：当在配置文件中指定生成测试用例的数量时，系统可能会根据实际测试情况进行代理重新规划和调整。这可能导致最终执行的测试用例数量与初始设定存在一定出入，以确保测试的准确性和有效性。
+- **AI模式**：采用两阶段规划架构，第一阶段（filter_model）优先排序元素以实现高效分析，第二阶段（主模型）生成全面的测试用例。系统会根据实际页面情况和测试覆盖率进行反思和重新规划，这可能导致最终执行的测试用例数量与初始设定存在一定出入，以确保测试的有效性。当启用 `dynamic_step_generation` 时，系统会通过DOM差异分析自动为新出现的UI元素（如下拉菜单、模态框）生成额外的测试步骤。
 
 - **Default模式**：功能测试的 `default` 模式主要验证UI元素的点击行为是否成功执行，包括按钮点击、链接跳转等基本交互功能。
 
 #### 2. 用户体验测试说明
 
-UX（用户体验）评估关注网页可用性与友好性。结果中的模型输出基于最佳实践给出改进建议，便于设计与开发参考。
+UX（用户体验）评估关注网页可用性与友好性。采用多模态分析，结合截图、DOM结构和文本内容来评估视觉质量、检测拼写/语法问题以及验证布局渲染。结果中的模型输出基于最佳实践给出改进建议，便于设计与开发参考。
 
 ### 🧠 推荐模型
 
-基于实际测试结果，以下模型表现较好，推荐使用：
+以下模型经过适配与验证，推荐使用：
 
-| 模型                                | 核心优势         | 使用建议       |
-|-----------------------------------|--------------|------------|
-| **gpt-4.1-2025-04-14** ⭐          | 高准确性与可靠性     | **最佳选择**   |
-| **gpt-4.1-mini-2025-04-14**       | 性价比高         | **经济实用**   |
-| **qwen3-vl-235b-a22b-instruct**   | 媲美gpt-4.1，开源 | **私有部署首选** |
-| **doubao-seed-1-6-vision-250815** | 支持视觉识别       | **网页理解优异** |
+| 模型                                | 推荐理由 |
+|-----------------------------------|------|
+| **gpt-4.1-2025-04-14**            | 准确性与可靠性较高 |
+| **gpt-4.1-mini-2025-04-14**       | 经济实用，性价比高 |
+| **qwen3-vl-235b-a22b-instruct**   | 开源模型，私有部署首选 |
+| **doubao-seed-1-6-vision-250815** | 网页理解较优异，支持视觉识别 |
 
 ### 查看结果
 
